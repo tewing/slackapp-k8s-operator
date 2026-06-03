@@ -16,15 +16,6 @@ type SlackAppSpec struct {
 	// +kubebuilder:validation:Schemaless
 	// +kubebuilder:validation:Type=object
 	Manifest runtime.RawExtension `json:"manifest"`
-
-	// IconURL is an optional HTTP(S) URL to a square PNG/JPG used as the app's
-	// icon. Slack's public manifest API does not support icons, so the operator
-	// applies it on a best-effort basis via the internal apps.icon.set endpoint;
-	// failures are surfaced on status but do not fail the whole reconcile.
-	//
-	// +optional
-	// +kubebuilder:validation:Pattern=`^https?://.+`
-	IconURL string `json:"iconURL,omitempty"`
 }
 
 // SlackAppStatus defines the observed state of a Slack app.
@@ -39,16 +30,12 @@ type SlackAppStatus struct {
 	// +optional
 	ManifestHash string `json:"manifestHash,omitempty"`
 
-	// IconHash is the SHA-256 of the icon URL last successfully applied.
-	// +optional
-	IconHash string `json:"iconHash,omitempty"`
-
 	// ObservedGeneration is the .metadata.generation last reconciled.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// Conditions represent the latest available observations of the app's state.
-	// Types: Ready, IconApplied.
+	// Types: Ready.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

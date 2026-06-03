@@ -1,15 +1,12 @@
 // Package slack is a thin client over the Slack App Management API methods the
-// operator needs: config-token rotation, manifest CRUD, and a best-effort icon
-// upload via the (undocumented) internal apps.icon.set endpoint.
+// operator needs: config-token rotation and manifest CRUD.
 package slack
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -132,50 +129,6 @@ func (c *Client) DeleteApp(ctx context.Context, accessToken, appID string) error
 			return nil
 		}
 		return fmt.Errorf("apps.manifest.delete failed: %s", out.Error)
-	}
-	return nil
-}
-
-// SetIcon uploads an app icon via the internal apps.icon.set endpoint. This is
-// NOT part of Slack's public, supported API — it mirrors what the app config
-// web UI does — so callers should treat failures as non-fatal.
-func (c *Client) SetIcon(ctx context.Context, accessToken, appID, filename string, image io.Reader) error {
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	if err := w.WriteField("app_id", appID); err != nil {
-		return err
-	}
-	part, err := w.CreateFormFile("image", filename)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(part, image); err != nil {
-		return err
-	}
-	if err := w.Close(); err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/apps.icon.set", &body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", w.FormDataContentType())
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var out apiError
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return fmt.Errorf("apps.icon.set: unexpected response (status %d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	if !out.OK {
-		return fmt.Errorf("apps.icon.set failed: %s", out.Error)
 	}
 	return nil
 }
