@@ -38,15 +38,17 @@ type SlackAppReconciler struct {
 	// decision is gated on it rather than the cached client, because the cache
 	// can lag a just-persisted status write — which previously let a second
 	// reconcile re-run the non-idempotent apps.manifest.create.
-	APIReader client.Reader
-	Slack     *slack.Client
-	Tokens    *TokenStore
+	APIReader  client.Reader
+	Slack      *slack.Client
+	Tokens     *TokenManager
+	Workspaces *WorkspaceResolver
 }
 
 // +kubebuilder:rbac:groups=slack.te-labs.org,resources=slackapps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=slack.te-labs.org,resources=slackapps/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=slack.te-labs.org,resources=slackapps/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
 func (r *SlackAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
@@ -73,7 +75,24 @@ func (r *SlackAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.fail(ctx, req.NamespacedName, "InvalidManifest", err)
 	}
 
-	token, err := r.Tokens.AccessToken(ctx)
+	// Which workspace (and therefore which token) this app belongs to.
+	workspace := app.Annotations[workspaceAnnotation]
+	if workspace == "" {
+		return r.fail(ctx, req.NamespacedName, "WorkspaceRequired",
+			fmt.Errorf("annotation %q is required to select a Slack workspace", workspaceAnnotation))
+	}
+	// A Slack app lives in the workspace it was created in; it can't be moved.
+	if app.Status.Workspace != "" && app.Status.Workspace != workspace {
+		return r.fail(ctx, req.NamespacedName, "WorkspaceImmutable",
+			fmt.Errorf("workspace is immutable: app was created in %q, cannot reassign to %q", app.Status.Workspace, workspace))
+	}
+
+	secretName, err := r.Workspaces.SecretFor(ctx, workspace)
+	if err != nil {
+		return r.fail(ctx, req.NamespacedName, "UnknownWorkspace", err)
+	}
+
+	token, err := r.Tokens.AccessToken(ctx, secretName)
 	if err != nil {
 		return r.fail(ctx, req.NamespacedName, "TokenUnavailable", err)
 	}
@@ -99,6 +118,7 @@ func (r *SlackAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		// not idempotent, so this write is the only thing preventing duplicates.
 		if err := r.patchStatus(ctx, req.NamespacedName, func(a *slackv1alpha1.SlackApp) {
 			a.Status.AppID = newID
+			a.Status.Workspace = workspace
 			a.Status.ManifestHash = manifestHash
 		}); err != nil {
 			l.Error(err, "created Slack app but FAILED to persist its ID — manual cleanup may be needed", "appID", newID)
@@ -113,6 +133,7 @@ func (r *SlackAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	if err := r.patchStatus(ctx, req.NamespacedName, func(a *slackv1alpha1.SlackApp) {
 		a.Status.AppID = appID
+		a.Status.Workspace = workspace
 		a.Status.ManifestHash = manifestHash
 		a.Status.ObservedGeneration = a.Generation
 		meta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{
@@ -154,14 +175,27 @@ func (r *SlackAppReconciler) reconcileDelete(ctx context.Context, app *slackv1al
 		return ctrl.Result{}, err
 	}
 	if appID != "" {
-		token, err := r.Tokens.AccessToken(ctx)
+		// Delete against the workspace the app was created in (recorded in
+		// status), not the current annotation, which may have drifted.
+		workspace := app.Status.Workspace
+		if workspace == "" {
+			workspace = app.Annotations[workspaceAnnotation]
+		}
+		if workspace == "" {
+			return ctrl.Result{}, fmt.Errorf("cannot delete Slack app %s: no workspace recorded on status or annotation", appID)
+		}
+		secretName, err := r.Workspaces.SecretFor(ctx, workspace)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("resolve workspace %q for delete: %w", workspace, err)
+		}
+		token, err := r.Tokens.AccessToken(ctx, secretName)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("cannot delete Slack app without a token: %w", err)
 		}
 		if err := r.Slack.DeleteApp(ctx, token, appID); err != nil {
 			return ctrl.Result{}, fmt.Errorf("delete Slack app %s: %w", appID, err)
 		}
-		l.Info("deleted Slack app", "appID", appID)
+		l.Info("deleted Slack app", "appID", appID, "workspace", workspace)
 	}
 
 	controllerutil.RemoveFinalizer(app, finalizer)

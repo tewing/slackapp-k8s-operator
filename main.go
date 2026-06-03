@@ -24,14 +24,14 @@ var setupLog = ctrl.Log.WithName("setup")
 
 func main() {
 	var metricsAddr, probeAddr string
-	var tokenSecretName, tokenSecretNamespace string
+	var operatorNamespace, workspaceConfigName string
 	var enableLeaderElection bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
-	flag.StringVar(&tokenSecretName, "token-secret-name", "slack-operator-tokens", "Name of the Secret holding Slack config tokens.")
-	flag.StringVar(&tokenSecretNamespace, "token-secret-namespace", "", "Namespace of the token Secret (defaults to the pod namespace).")
+	flag.StringVar(&operatorNamespace, "namespace", "", "Namespace holding the per-workspace token Secrets and the workspace ConfigMap (defaults to the pod namespace).")
+	flag.StringVar(&workspaceConfigName, "workspace-config-name", "slack-operator-workspaces", "Name of the ConfigMap mapping workspace labels to token Secret names.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -42,8 +42,8 @@ func main() {
 	scheme := clientgoscheme.Scheme
 	utilruntime.Must(slackv1alpha1.AddToScheme(scheme))
 
-	if tokenSecretNamespace == "" {
-		tokenSecretNamespace = podNamespace()
+	if operatorNamespace == "" {
+		operatorNamespace = podNamespace()
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -52,14 +52,17 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "slack-operator.slack.te-labs.org",
-		// SlackApps are watched cluster-wide, but the only Secret the operator
-		// touches is the token Secret in its own namespace — scope that
-		// informer so it doesn't need (and isn't granted) cluster-wide
-		// secret access.
+		// SlackApps are watched cluster-wide, but the only Secrets/ConfigMaps the
+		// operator reads are the token Secrets and workspace ConfigMap in its own
+		// namespace — scope those informers so it doesn't need (and isn't granted)
+		// cluster-wide access.
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				&corev1.Secret{}: {
-					Namespaces: map[string]cache.Config{tokenSecretNamespace: {}},
+					Namespaces: map[string]cache.Config{operatorNamespace: {}},
+				},
+				&corev1.ConfigMap{}: {
+					Namespaces: map[string]cache.Config{operatorNamespace: {}},
 				},
 			},
 		},
@@ -70,15 +73,17 @@ func main() {
 	}
 
 	slackClient := slack.New()
-	tokenStore := controller.NewTokenStore(mgr.GetClient(), slackClient, types.NamespacedName{
-		Name:      tokenSecretName,
-		Namespace: tokenSecretNamespace,
+	tokens := controller.NewTokenManager(mgr.GetClient(), slackClient, operatorNamespace)
+	workspaces := controller.NewWorkspaceResolver(mgr.GetClient(), types.NamespacedName{
+		Name:      workspaceConfigName,
+		Namespace: operatorNamespace,
 	})
 
 	if err := (&controller.SlackAppReconciler{
-		Client: mgr.GetClient(),
-		Slack:  slackClient,
-		Tokens: tokenStore,
+		Client:     mgr.GetClient(),
+		Slack:      slackClient,
+		Tokens:     tokens,
+		Workspaces: workspaces,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SlackApp")
 		os.Exit(1)
@@ -93,7 +98,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager", "tokenSecret", tokenSecretNamespace+"/"+tokenSecretName)
+	setupLog.Info("starting manager", "namespace", operatorNamespace, "workspaceConfig", workspaceConfigName)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
