@@ -25,6 +25,13 @@ type SlackAppStatus struct {
 	// +optional
 	AppID string `json:"appID,omitempty"`
 
+	// Workspace is the workspace label (from the slack.te-labs.org/workspace
+	// annotation) the app was created in. It is recorded on create and is
+	// immutable thereafter — the app lives in that workspace and can only be
+	// managed with that workspace's token.
+	// +optional
+	Workspace string `json:"workspace,omitempty"`
+
 	// ManifestHash is the SHA-256 of the last manifest successfully pushed to
 	// Slack. Used to skip no-op updates.
 	// +optional
