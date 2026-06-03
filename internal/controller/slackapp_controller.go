@@ -1,15 +1,11 @@
 package controller
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"path"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -28,19 +24,11 @@ import (
 const (
 	finalizer = "slack.te-labs.org/finalizer"
 
-	condReady       = "Ready"
-	condIconApplied = "IconApplied"
+	condReady = "Ready"
 
 	// resyncPeriod keeps tokens warm and corrects drift even when nothing
 	// changes in the CR.
 	resyncPeriod = time.Hour
-
-	maxIconBytes = 5 << 20 // 5 MiB
-
-	// iconUserAgent identifies the operator when fetching icon images. Some
-	// hosts (e.g. Wikimedia) return 403 to the Go default User-Agent and
-	// require a descriptive one.
-	iconUserAgent = "slackapp-k8s-operator (+https://github.com/tewing/slackapp-k8s-operator)"
 )
 
 // SlackAppReconciler reconciles a SlackApp object against the Slack API.
@@ -123,8 +111,6 @@ func (r *SlackAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		l.Info("updated Slack app", "appID", appID)
 	}
 
-	icon := r.reconcileIcon(ctx, appID, app.Spec.IconURL, app.Status.IconHash, token)
-
 	if err := r.patchStatus(ctx, req.NamespacedName, func(a *slackv1alpha1.SlackApp) {
 		a.Status.AppID = appID
 		a.Status.ManifestHash = manifestHash
@@ -136,7 +122,6 @@ func (r *SlackAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			Message:            fmt.Sprintf("Slack app %s is in sync", appID),
 			ObservedGeneration: a.Generation,
 		})
-		icon.apply(a)
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -181,58 +166,6 @@ func (r *SlackAppReconciler) reconcileDelete(ctx context.Context, app *slackv1al
 
 	controllerutil.RemoveFinalizer(app, finalizer)
 	return ctrl.Result{}, r.Update(ctx, app)
-}
-
-// iconOutcome carries the result of a best-effort icon apply so it can be folded
-// into the status update transaction. A nil outcome means "no change".
-type iconOutcome struct {
-	hash string
-	err  error
-}
-
-func (o *iconOutcome) apply(a *slackv1alpha1.SlackApp) {
-	if o == nil {
-		return
-	}
-	if o.err != nil {
-		meta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{
-			Type:               condIconApplied,
-			Status:             metav1.ConditionFalse,
-			Reason:             "IconFailed",
-			Message:            o.err.Error(),
-			ObservedGeneration: a.Generation,
-		})
-		return
-	}
-	a.Status.IconHash = o.hash
-	meta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{
-		Type:               condIconApplied,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Applied",
-		Message:            "Icon uploaded via apps.icon.set",
-		ObservedGeneration: a.Generation,
-	})
-}
-
-// reconcileIcon applies the icon on a best-effort basis (Slack's icon endpoint
-// is unofficial). It returns nil when there is nothing to do.
-func (r *SlackAppReconciler) reconcileIcon(ctx context.Context, appID, iconURL, currentHash, token string) *iconOutcome {
-	if iconURL == "" {
-		return nil
-	}
-	h := hashString(iconURL)
-	if h == currentHash {
-		return nil
-	}
-
-	filename, data, err := fetchImage(ctx, iconURL)
-	if err == nil {
-		err = r.Slack.SetIcon(ctx, token, appID, filename, bytes.NewReader(data))
-	}
-	if err != nil {
-		log.FromContext(ctx).Error(err, "best-effort icon apply failed", "iconURL", iconURL)
-	}
-	return &iconOutcome{hash: h, err: err}
 }
 
 func (r *SlackAppReconciler) fail(ctx context.Context, key types.NamespacedName, reason string, cause error) (ctrl.Result, error) {
@@ -291,40 +224,4 @@ func canonicalManifest(raw []byte) (string, string, error) {
 func hashString(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
-}
-
-func fetchImage(ctx context.Context, rawURL string) (string, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return "", nil, err
-	}
-	req.Header.Set("User-Agent", iconUserAgent)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", nil, fmt.Errorf("fetch icon: status %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxIconBytes+1))
-	if err != nil {
-		return "", nil, err
-	}
-	if len(data) > maxIconBytes {
-		return "", nil, fmt.Errorf("icon exceeds %d bytes", maxIconBytes)
-	}
-
-	filename := path.Base(resp.Request.URL.Path)
-	if ext := path.Ext(filename); ext == "" {
-		switch resp.Header.Get("Content-Type") {
-		case "image/png":
-			filename = "icon.png"
-		case "image/jpeg":
-			filename = "icon.jpg"
-		default:
-			filename = "icon"
-		}
-	}
-	return filename, data, nil
 }
