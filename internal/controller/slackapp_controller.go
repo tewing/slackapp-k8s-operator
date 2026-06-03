@@ -36,6 +36,11 @@ const (
 	resyncPeriod = time.Hour
 
 	maxIconBytes = 5 << 20 // 5 MiB
+
+	// iconUserAgent identifies the operator when fetching icon images. Some
+	// hosts (e.g. Wikimedia) return 403 to the Go default User-Agent and
+	// require a descriptive one.
+	iconUserAgent = "slackapp-k8s-operator (+https://github.com/tewing/slackapp-k8s-operator)"
 )
 
 // SlackAppReconciler reconciles a SlackApp object against the Slack API.
@@ -293,6 +298,7 @@ func fetchImage(ctx context.Context, rawURL string) (string, []byte, error) {
 	if err != nil {
 		return "", nil, err
 	}
+	req.Header.Set("User-Agent", iconUserAgent)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", nil, err
