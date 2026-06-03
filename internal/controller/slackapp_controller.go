@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,12 +10,12 @@ import (
 	"io"
 	"net/http"
 	"path"
-	"strings"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -40,8 +41,13 @@ const (
 // SlackAppReconciler reconciles a SlackApp object against the Slack API.
 type SlackAppReconciler struct {
 	client.Client
-	Slack  *slack.Client
-	Tokens *TokenStore
+	// APIReader is an uncached reader (direct to the API server). The create
+	// decision is gated on it rather than the cached client, because the cache
+	// can lag a just-persisted status write — which previously let a second
+	// reconcile re-run the non-idempotent apps.manifest.create.
+	APIReader client.Reader
+	Slack     *slack.Client
+	Tokens    *TokenStore
 }
 
 // +kubebuilder:rbac:groups=slack.te-labs.org,resources=slackapps,verbs=get;list;watch;create;update;patch;delete
@@ -71,44 +77,78 @@ func (r *SlackAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	manifestJSON, manifestHash, err := canonicalManifest(app.Spec.Manifest.Raw)
 	if err != nil {
-		return r.fail(ctx, &app, "InvalidManifest", err)
+		return r.fail(ctx, req.NamespacedName, "InvalidManifest", err)
 	}
 
 	token, err := r.Tokens.AccessToken(ctx)
 	if err != nil {
-		return r.fail(ctx, &app, "TokenUnavailable", err)
+		return r.fail(ctx, req.NamespacedName, "TokenUnavailable", err)
 	}
 
-	if app.Status.AppID == "" {
-		appID, err := r.Slack.CreateApp(ctx, token, manifestJSON)
+	// Authoritative app ID. The cached status can be stale immediately after a
+	// create; an uncached read ensures we never create a second app for a CR
+	// that already has one recorded.
+	appID, err := r.currentAppID(ctx, req.NamespacedName, app.Status.AppID)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	switch {
+	case appID == "":
+		newID, err := r.Slack.CreateApp(ctx, token, manifestJSON)
 		if err != nil {
-			return r.fail(ctx, &app, "CreateFailed", err)
+			return r.fail(ctx, req.NamespacedName, "CreateFailed", err)
 		}
-		l.Info("created Slack app", "appID", appID)
-		app.Status.AppID = appID
-		app.Status.ManifestHash = manifestHash
-	} else if app.Status.ManifestHash != manifestHash {
-		if err := r.Slack.UpdateApp(ctx, token, app.Status.AppID, manifestJSON); err != nil {
-			return r.fail(ctx, &app, "UpdateFailed", err)
+		l.Info("created Slack app", "appID", newID)
+		appID = newID
+		// Record the new ID immediately and durably, before any further work or
+		// requeue can re-enter and create a duplicate. apps.manifest.create is
+		// not idempotent, so this write is the only thing preventing duplicates.
+		if err := r.patchStatus(ctx, req.NamespacedName, func(a *slackv1alpha1.SlackApp) {
+			a.Status.AppID = newID
+			a.Status.ManifestHash = manifestHash
+		}); err != nil {
+			l.Error(err, "created Slack app but FAILED to persist its ID — manual cleanup may be needed", "appID", newID)
+			return ctrl.Result{}, err
 		}
-		l.Info("updated Slack app", "appID", app.Status.AppID)
-		app.Status.ManifestHash = manifestHash
+	case app.Status.ManifestHash != manifestHash:
+		if err := r.Slack.UpdateApp(ctx, token, appID, manifestJSON); err != nil {
+			return r.fail(ctx, req.NamespacedName, "UpdateFailed", err)
+		}
+		l.Info("updated Slack app", "appID", appID)
 	}
 
-	r.reconcileIcon(ctx, &app, token)
+	icon := r.reconcileIcon(ctx, appID, app.Spec.IconURL, app.Status.IconHash, token)
 
-	app.Status.ObservedGeneration = app.Generation
-	meta.SetStatusCondition(&app.Status.Conditions, metav1.Condition{
-		Type:               condReady,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Synced",
-		Message:            fmt.Sprintf("Slack app %s is in sync", app.Status.AppID),
-		ObservedGeneration: app.Generation,
-	})
-	if err := r.Status().Update(ctx, &app); err != nil {
+	if err := r.patchStatus(ctx, req.NamespacedName, func(a *slackv1alpha1.SlackApp) {
+		a.Status.AppID = appID
+		a.Status.ManifestHash = manifestHash
+		a.Status.ObservedGeneration = a.Generation
+		meta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{
+			Type:               condReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Synced",
+			Message:            fmt.Sprintf("Slack app %s is in sync", appID),
+			ObservedGeneration: a.Generation,
+		})
+		icon.apply(a)
+	}); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: resyncPeriod}, nil
+}
+
+// currentAppID returns the cached value if set, otherwise consults the API
+// server directly (the cache may not yet reflect a freshly persisted AppID).
+func (r *SlackAppReconciler) currentAppID(ctx context.Context, key types.NamespacedName, cached string) (string, error) {
+	if cached != "" {
+		return cached, nil
+	}
+	var fresh slackv1alpha1.SlackApp
+	if err := r.APIReader.Get(ctx, key, &fresh); err != nil {
+		return "", err
+	}
+	return fresh.Status.AppID, nil
 }
 
 func (r *SlackAppReconciler) reconcileDelete(ctx context.Context, app *slackv1alpha1.SlackApp) (ctrl.Result, error) {
@@ -117,73 +157,110 @@ func (r *SlackAppReconciler) reconcileDelete(ctx context.Context, app *slackv1al
 		return ctrl.Result{}, nil
 	}
 
-	if app.Status.AppID != "" {
+	// Use the authoritative AppID so a delete that races a just-completed
+	// create still removes the Slack app rather than orphaning it.
+	appID, err := r.currentAppID(ctx, client.ObjectKeyFromObject(app), app.Status.AppID)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if appID != "" {
 		token, err := r.Tokens.AccessToken(ctx)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("cannot delete Slack app without a token: %w", err)
 		}
-		if err := r.Slack.DeleteApp(ctx, token, app.Status.AppID); err != nil {
-			return ctrl.Result{}, fmt.Errorf("delete Slack app %s: %w", app.Status.AppID, err)
+		if err := r.Slack.DeleteApp(ctx, token, appID); err != nil {
+			return ctrl.Result{}, fmt.Errorf("delete Slack app %s: %w", appID, err)
 		}
-		l.Info("deleted Slack app", "appID", app.Status.AppID)
+		l.Info("deleted Slack app", "appID", appID)
 	}
 
 	controllerutil.RemoveFinalizer(app, finalizer)
 	return ctrl.Result{}, r.Update(ctx, app)
 }
 
-// reconcileIcon applies the icon on a best-effort basis. Failures are recorded
-// on the IconApplied condition but never fail the reconcile, because Slack's
-// icon endpoint is unofficial.
-func (r *SlackAppReconciler) reconcileIcon(ctx context.Context, app *slackv1alpha1.SlackApp, token string) {
-	if app.Spec.IconURL == "" {
-		return
-	}
-	iconHash := hashString(app.Spec.IconURL)
-	if iconHash == app.Status.IconHash {
-		return
-	}
+// iconOutcome carries the result of a best-effort icon apply so it can be folded
+// into the status update transaction. A nil outcome means "no change".
+type iconOutcome struct {
+	hash string
+	err  error
+}
 
-	filename, data, err := fetchImage(ctx, app.Spec.IconURL)
-	if err == nil {
-		err = r.Slack.SetIcon(ctx, token, app.Status.AppID, filename, strings.NewReader(string(data)))
+func (o *iconOutcome) apply(a *slackv1alpha1.SlackApp) {
+	if o == nil {
+		return
 	}
-	if err != nil {
-		meta.SetStatusCondition(&app.Status.Conditions, metav1.Condition{
+	if o.err != nil {
+		meta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{
 			Type:               condIconApplied,
 			Status:             metav1.ConditionFalse,
 			Reason:             "IconFailed",
-			Message:            err.Error(),
-			ObservedGeneration: app.Generation,
+			Message:            o.err.Error(),
+			ObservedGeneration: a.Generation,
 		})
-		log.FromContext(ctx).Error(err, "best-effort icon apply failed", "iconURL", app.Spec.IconURL)
 		return
 	}
-	app.Status.IconHash = iconHash
-	meta.SetStatusCondition(&app.Status.Conditions, metav1.Condition{
+	a.Status.IconHash = o.hash
+	meta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{
 		Type:               condIconApplied,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Applied",
 		Message:            "Icon uploaded via apps.icon.set",
-		ObservedGeneration: app.Generation,
+		ObservedGeneration: a.Generation,
 	})
 }
 
-func (r *SlackAppReconciler) fail(ctx context.Context, app *slackv1alpha1.SlackApp, reason string, cause error) (ctrl.Result, error) {
-	meta.SetStatusCondition(&app.Status.Conditions, metav1.Condition{
-		Type:               condReady,
-		Status:             metav1.ConditionFalse,
-		Reason:             reason,
-		Message:            cause.Error(),
-		ObservedGeneration: app.Generation,
-	})
-	if err := r.Status().Update(ctx, app); err != nil && !apierrors.IsConflict(err) {
+// reconcileIcon applies the icon on a best-effort basis (Slack's icon endpoint
+// is unofficial). It returns nil when there is nothing to do.
+func (r *SlackAppReconciler) reconcileIcon(ctx context.Context, appID, iconURL, currentHash, token string) *iconOutcome {
+	if iconURL == "" {
+		return nil
+	}
+	h := hashString(iconURL)
+	if h == currentHash {
+		return nil
+	}
+
+	filename, data, err := fetchImage(ctx, iconURL)
+	if err == nil {
+		err = r.Slack.SetIcon(ctx, token, appID, filename, bytes.NewReader(data))
+	}
+	if err != nil {
+		log.FromContext(ctx).Error(err, "best-effort icon apply failed", "iconURL", iconURL)
+	}
+	return &iconOutcome{hash: h, err: err}
+}
+
+func (r *SlackAppReconciler) fail(ctx context.Context, key types.NamespacedName, reason string, cause error) (ctrl.Result, error) {
+	if err := r.patchStatus(ctx, key, func(a *slackv1alpha1.SlackApp) {
+		meta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{
+			Type:               condReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             reason,
+			Message:            cause.Error(),
+			ObservedGeneration: a.Generation,
+		})
+	}); err != nil {
 		log.FromContext(ctx).Error(err, "failed to update status after error")
 	}
 	return ctrl.Result{}, cause
 }
 
+// patchStatus applies mutate to a freshly-read copy of the object and writes the
+// status, retrying on optimistic-lock conflicts. The read is uncached so each
+// attempt starts from the latest resourceVersion.
+func (r *SlackAppReconciler) patchStatus(ctx context.Context, key types.NamespacedName, mutate func(*slackv1alpha1.SlackApp)) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur slackv1alpha1.SlackApp
+		if err := r.APIReader.Get(ctx, key, &cur); err != nil {
+			return err
+		}
+		mutate(&cur)
+		return r.Status().Update(ctx, &cur)
+	})
+}
+
 func (r *SlackAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&slackv1alpha1.SlackApp{}).
 		Complete(r)
